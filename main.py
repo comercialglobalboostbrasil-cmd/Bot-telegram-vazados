@@ -2,15 +2,11 @@ import os
 import json
 import sqlite3
 import asyncio
-import base64
-import re
 import logging
 from datetime import datetime, timedelta, timezone
-from io import BytesIO
 from typing import Any, Optional, Tuple
 
 import requests
-import qrcode
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
@@ -44,8 +40,8 @@ FIXED_EMAIL = os.getenv("FIXED_EMAIL", "cliente@exemplo.com")
 FIXED_PHONE = os.getenv("FIXED_PHONE", "11999999999")
 FIXED_DOCUMENT = os.getenv("FIXED_DOCUMENT", "00000000000")
 
-GROUP_INVITE_LINK = os.getenv("GROUP_INVITE_LINK")  # link fixo
-GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")          # -100... (opcional)
+GROUP_INVITE_LINK = os.getenv("GROUP_INVITE_LINK")
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 
 APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
 APP_PORT = int(os.getenv("PORT", "10000"))
@@ -154,10 +150,9 @@ def find_telegram_by_tx(tx_id: str) -> Optional[int]:
 
 
 # =========================
-# EXTRATORES (EMV/QR)
+# EXTRATOR EMV (Pix Copia e Cola)
 # =========================
 EMV_START = "000201"
-URL_REGEX = re.compile(r"(https?://[^\s\"\\]+)")
 
 def walk_values(obj: Any):
     if isinstance(obj, dict):
@@ -170,6 +165,7 @@ def walk_values(obj: Any):
         yield obj
 
 def find_emv(resp_json: dict, raw_text: str) -> Optional[str]:
+    # procura em qualquer string do JSON
     for v in walk_values(resp_json):
         if isinstance(v, str):
             s = v.strip()
@@ -181,6 +177,7 @@ def find_emv(resp_json: dict, raw_text: str) -> Optional[str]:
                 if len(cand) > 50:
                     return cand
 
+    # procura no texto cru
     if raw_text and EMV_START in raw_text:
         i = raw_text.find(EMV_START)
         cand = raw_text[i:i+3000]
@@ -189,48 +186,13 @@ def find_emv(resp_json: dict, raw_text: str) -> Optional[str]:
             return cand
     return None
 
-def looks_like_base64(s: str) -> bool:
-    if not s or len(s) < 200:
-        return False
-    if s.startswith("data:image/") and "base64," in s:
-        return True
-    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\n\r")
-    sample = s[:300]
-    return all(c in allowed for c in sample)
-
-def find_qr_base64(resp_json: dict, raw_text: str) -> Optional[str]:
-    for v in walk_values(resp_json):
-        if isinstance(v, str):
-            s = v.strip()
-            if s.startswith("data:image/") and "base64," in s:
-                return s.split("base64,", 1)[-1]
-            if looks_like_base64(s):
-                return s
-
-    if raw_text:
-        m = re.search(r"data:image/[^;]+;base64,([A-Za-z0-9+/=\n\r]+)", raw_text)
-        if m:
-            return m.group(1)
-    return None
-
-def qr_from_emv(emv: str) -> BytesIO:
-    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M)
-    qr.add_data(emv)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    bio = BytesIO()
-    bio.name = "pix_qr.png"
-    img.save(bio, format="PNG")
-    bio.seek(0)
-    return bio
-
 
 # =========================
-# INVICUTS: criar transação pix
+# INVICTUS: criar transação pix
 # =========================
-def create_pix_transaction(telegram_id: int) -> Tuple[dict, Optional[str], Optional[str], Optional[str], str]:
+def create_pix_transaction(telegram_id: int) -> Tuple[dict, Optional[str], Optional[str], str]:
     """
-    retorna: resp_json, tx_id, emv, qr_base64, raw_text
+    retorna: resp_json, tx_id, emv, raw_text
     """
     url = (
         "https://api.invictuspay.app.br/api/public/v1/transactions"
@@ -285,9 +247,8 @@ def create_pix_transaction(telegram_id: int) -> Tuple[dict, Optional[str], Optio
     ).strip() or None
 
     emv = find_emv(resp_json, raw_text)
-    qr_b64 = find_qr_base64(resp_json, raw_text)
 
-    return resp_json, tx_id, emv, qr_b64, raw_text
+    return resp_json, tx_id, emv, raw_text
 
 
 # =========================
@@ -324,7 +285,10 @@ async def start_cmd(message: types.Message):
 async def status_cmd(message: types.Message):
     status, expires_at = get_user(message.from_user.id)
     if status == "active" and expires_at:
-        await message.answer(f"✅ Assinatura ATIVA\n📅 Válida até: {fmt_dt(expires_at)}\n\nPara renovar, use /start.")
+        await message.answer(
+            f"✅ Assinatura ATIVA\n📅 Válida até: {fmt_dt(expires_at)}\n\n"
+            "Para renovar, use /start."
+        )
     else:
         await message.answer("⚠️ Você está SEM assinatura ativa.\nUse /start para assinar/renovar.")
 
@@ -340,42 +304,22 @@ async def status_cb(call: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "pay")
 async def pay_cb(call: types.CallbackQuery):
     telegram_id = call.from_user.id
-    log.info("CLICK PAY - gerar pix")
+    log.info("CLICK PAY - gerar pix (somente copia e cola)")
 
     try:
-        resp_json, tx_id, emv, qr_b64, raw_text = create_pix_transaction(telegram_id)
+        resp_json, tx_id, emv, raw_text = create_pix_transaction(telegram_id)
         save_tx(telegram_id, tx_id, "pending", resp_json)
 
-        # 1) mensagem + copia e cola (SEM URL)
         if emv:
             await call.message.answer("✅ Segue o Pix Copia e Cola para fazer o pagamento:")
             await call.message.answer(f"`{emv}`", parse_mode="Markdown")
+            await call.message.answer("⏳ Assim que o pagamento for confirmado, o acesso será liberado automaticamente.")
         else:
             await call.message.answer(
                 "⚠️ Não encontrei o Pix Copia e Cola na resposta.\n"
                 "Abra Render → Logs e procure: INVICTUS_CREATE_JSON."
             )
 
-        # 2) QR depois
-        await call.message.answer("📌 Aqui está o QR Code se preferir:")
-
-        sent_qr = False
-        if qr_b64:
-            try:
-                img_bytes = base64.b64decode(qr_b64)
-                bio = BytesIO(img_bytes)
-                bio.name = "pix_qr.png"
-                bio.seek(0)
-                await bot.send_photo(call.message.chat.id, photo=bio)
-                sent_qr = True
-            except Exception as e:
-                log.warning(f"Falha ao enviar QR base64: {e}")
-
-        if (not sent_qr) and emv:
-            await bot.send_photo(call.message.chat.id, photo=qr_from_emv(emv))
-            sent_qr = True
-
-        await call.message.answer("⏳ Assim que o pagamento for confirmado, o acesso será liberado automaticamente.")
         await call.answer()
 
     except requests.HTTPError as e:
