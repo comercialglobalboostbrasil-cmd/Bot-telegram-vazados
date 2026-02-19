@@ -2,4 +2,3 @@ aiogram==3.*
 fastapi
 uvicorn
 requests
-qrcode
